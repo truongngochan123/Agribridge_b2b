@@ -1,0 +1,407 @@
+import {
+  Bell,
+  ClipboardList,
+  LayoutGrid,
+  LogOut,
+  Menu,
+  Package,
+  Store,
+  Truck,
+  Wallet,
+  Search,
+  LineChart,
+  X,
+} from 'lucide-react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom'
+import { buyerMenuItems } from '../../data/buyerDashboardData'
+import { NotificationDrawer } from '../site/NotificationDrawer'
+import type { BuyerMenuKey } from '../../types/buyerDashboard'
+import { useCurrentUserProfile } from '../../hooks/useCurrentUserProfile'
+import { clearCurrentUserProfileCache } from '../../services/currentUserService'
+import { clearAuthSession } from '../../services/authSession'
+import { fetchNotifications, resolveNotificationRoute, type AppNotification } from '../../services/notificationService'
+import { createNotificationRealtimeClient, dispatchNotificationRealtime } from '../../services/notificationRealtimeService'
+import { getNotificationSoundEnabled, playNotificationSound, setNotificationSoundEnabled } from '../../services/notificationSoundService'
+import { buildBranchScopedPath, getBranchContextFromSearchParams } from '../../utils/branchContext'
+
+type BuyerShellProps = {
+  activeKey: BuyerMenuKey
+  title: string
+  subtitle: string
+  actions?: ReactNode
+  filterBar?: ReactNode
+  children: ReactNode
+}
+
+const iconByKey = {
+  overview: LayoutGrid,
+  sourcing: Search,
+  rfq: ClipboardList,
+  orders: Package,
+  branches: Store,
+  delivery: Truck,
+  debt: Wallet,
+  wallet: Wallet,
+  market: LineChart,
+}
+
+const notificationModuleByMenuKey: Partial<Record<BuyerMenuKey, string[]>> = {
+  rfq: ['RFQ', 'QUOTE'],
+  orders: ['ORDER', 'PAYMENT'],
+  delivery: ['DELIVERY'],
+  debt: ['DEBT', 'PAYMENT'],
+  wallet: ['PAYMENT'],
+}
+
+function moduleCounts(items: AppNotification[]) {
+  return items.reduce<Record<string, number>>((counts, item) => {
+    if (item.isRead) return counts
+    const module = item.module || (item.type?.startsWith('PAYMENT_') ? 'PAYMENT' : item.type?.startsWith('ORDER_') ? 'ORDER' : item.type?.startsWith('RFQ_') ? 'RFQ' : item.type?.startsWith('DELIVERY_') ? 'DELIVERY' : item.type?.startsWith('DEBT_') ? 'DEBT' : item.type?.startsWith('COMPLAINT_') ? 'COMPLAINT' : 'SYSTEM')
+    counts[module] = (counts[module] || 0) + 1
+    return counts
+  }, {})
+}
+
+function formatBadgeCount(count: number) {
+  return count > 99 ? '99+' : String(count)
+}
+
+function totalUnreadModuleCount(counts: Record<string, number>) {
+  return Object.values(counts).reduce((sum, count) => sum + count, 0)
+}
+
+export function BuyerShell({ activeKey, title, subtitle, actions, filterBar, children }: BuyerShellProps) {
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const navigate = useNavigate()
+  const location = useLocation()
+  const [openNotifications, setOpenNotifications] = useState(false)
+  const [unreadCount, setUnreadCount] = useState(0)
+  const [notificationItems, setNotificationItems] = useState<AppNotification[]>([])
+  const [moduleBadgeCounts, setModuleBadgeCounts] = useState<Record<string, number>>({})
+  const [slideNotification, setSlideNotification] = useState<AppNotification | null>(null)
+  const [hasNewNotificationAnimation, setHasNewNotificationAnimation] = useState(false)
+  const [soundEnabled, setSoundEnabled] = useState(() => getNotificationSoundEnabled())
+  const maxSeenNotificationIdRef = useRef<number | null>(null)
+  const liveNotificationIdsRef = useRef<Set<number>>(new Set())
+  const notificationItemsRef = useRef<AppNotification[]>([])
+  const bellAnimationTimerRef = useRef<number | undefined>(undefined)
+  const slideTimerRef = useRef<number | undefined>(undefined)
+  const soundEnabledRef = useRef(soundEnabled)
+  const { profile } = useCurrentUserProfile()
+  const buyerName = profile?.fullName && profile.fullName !== 'N/A' ? profile.fullName : 'Bên mua'
+  const buyerRole = profile?.companyTypeLabel && profile.companyTypeLabel !== 'N/A' ? profile.companyTypeLabel : 'Nhà buôn'
+  const buyerInitials = profile?.initials && profile.initials !== 'N/A' ? profile.initials : buyerName.charAt(0).toUpperCase()
+  const displayedUnreadCount = Math.max(unreadCount, totalUnreadModuleCount(moduleBadgeCounts))
+  const branchContext = getBranchContextFromSearchParams(new URLSearchParams(location.search))
+
+  soundEnabledRef.current = soundEnabled
+  notificationItemsRef.current = notificationItems
+
+  // Close sidebar on Escape
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) { if (e.key === 'Escape') setSidebarOpen(false) }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [])
+
+  function closeSidebar() { setSidebarOpen(false) }
+
+  const handleLogout = () => {
+    clearAuthSession()
+
+    const sessionKeysToDelete: string[] = []
+    for (let index = 0; index < sessionStorage.length; index += 1) {
+      const key = sessionStorage.key(index)
+      if (key?.startsWith('agribridge.')) {
+        sessionKeysToDelete.push(key)
+      }
+    }
+    sessionKeysToDelete.forEach((key) => sessionStorage.removeItem(key))
+
+    clearCurrentUserProfileCache()
+    navigate('/auth/login', { replace: true })
+  }
+
+  useEffect(() => {
+    let cancelled = false
+    let timerId: number | undefined
+    const showNewNotification = (notification: AppNotification) => {
+      if (bellAnimationTimerRef.current) window.clearTimeout(bellAnimationTimerRef.current)
+      if (slideTimerRef.current) window.clearTimeout(slideTimerRef.current)
+      setHasNewNotificationAnimation(true)
+      bellAnimationTimerRef.current = window.setTimeout(() => setHasNewNotificationAnimation(false), 800)
+      setSlideNotification(notification)
+      slideTimerRef.current = window.setTimeout(() => setSlideNotification(null), 5000)
+    }
+    const realtimeClient = createNotificationRealtimeClient((notification) => {
+      if (liveNotificationIdsRef.current.has(notification.id)) return
+      liveNotificationIdsRef.current.add(notification.id)
+      maxSeenNotificationIdRef.current = Math.max(maxSeenNotificationIdRef.current || 0, notification.id)
+      if (!notification.isRead) setUnreadCount((count) => count + 1)
+      const nextItems = notificationItemsRef.current.some((item) => item.id === notification.id)
+        ? notificationItemsRef.current
+        : [notification, ...notificationItemsRef.current]
+      notificationItemsRef.current = nextItems
+      setNotificationItems(nextItems)
+      if (!notification.isRead && notification.module) {
+        setModuleBadgeCounts((counts) => ({ ...counts, [notification.module || 'SYSTEM']: (counts[notification.module || 'SYSTEM'] || 0) + 1 }))
+      }
+      showNewNotification(notification)
+      playNotificationSound(notification, soundEnabledRef.current)
+      void loadNotifications()
+    })
+
+    const loadNotifications = async () => {
+      try {
+        const data = await fetchNotifications()
+        if (cancelled) return
+        const dataItems = data.items || []
+        const nextItems = dataItems.length > 0 || notificationItemsRef.current.length === 0 ? dataItems : notificationItemsRef.current
+        notificationItemsRef.current = nextItems
+        setNotificationItems(nextItems)
+        setUnreadCount(dataItems.length > 0 || nextItems.length === 0 ? data.unreadCount || 0 : nextItems.filter((item) => !item.isRead).length)
+        setModuleBadgeCounts(moduleCounts(nextItems))
+        const latestUnread = (data.items || []).find((item) => !item.isRead)
+        const maxFetchedId = (data.items || []).reduce((maxId, item) => Math.max(maxId, item.id || 0), 0)
+        if (latestUnread && maxSeenNotificationIdRef.current !== null && latestUnread.id > maxSeenNotificationIdRef.current) {
+          liveNotificationIdsRef.current.add(latestUnread.id)
+          dispatchNotificationRealtime(latestUnread)
+          showNewNotification(latestUnread)
+        }
+        if (maxFetchedId > 0) {
+          maxSeenNotificationIdRef.current = Math.max(maxSeenNotificationIdRef.current || 0, maxFetchedId)
+        }
+      } catch {
+        if (!cancelled) {
+          setUnreadCount(notificationItemsRef.current.filter((item) => !item.isRead).length)
+        }
+      }
+    }
+
+    void loadNotifications()
+    realtimeClient?.activate()
+    timerId = window.setInterval(() => {
+      void loadNotifications()
+    }, 15000)
+
+    return () => {
+      cancelled = true
+      void realtimeClient?.deactivate()
+      if (timerId) window.clearInterval(timerId)
+      if (bellAnimationTimerRef.current) window.clearTimeout(bellAnimationTimerRef.current)
+      if (slideTimerRef.current) window.clearTimeout(slideTimerRef.current)
+    }
+  }, [])
+
+  /* ── Sidebar inner content ── */
+  function SidebarContent() {
+    const menuItems = buyerMenuItems.some((item) => item.key === 'wallet')
+      ? buyerMenuItems
+      : [
+          ...buyerMenuItems.slice(0, Math.max(0, buyerMenuItems.findIndex((item) => item.key === 'market'))),
+          { key: 'wallet' as const, label: 'Ví hoàn tiền', path: '/buyer/wallet' },
+          ...buyerMenuItems.slice(Math.max(0, buyerMenuItems.findIndex((item) => item.key === 'market'))),
+        ]
+    return (
+      <div className="flex h-full flex-col">
+        {/* Logo */}
+        <div className="border-b border-white/15 px-4 py-5">
+          <Link to="/buyer/overview" className="flex items-center gap-3" onClick={closeSidebar}>
+            <img src="/images/logo.png" alt="AgriBridge" className="h-8 w-8 rounded-lg" />
+            <div>
+              <p className="text-[22px] font-extrabold leading-none">AgriBridge</p>
+              <p className="text-xs text-emerald-100">Nhà buôn</p>
+            </div>
+          </Link>
+        </div>
+
+        {/* Nav */}
+        <nav className="flex-1 overflow-y-auto px-2 py-3">
+          <ul className="space-y-1.5">
+            {menuItems.map((item) => {
+              const Icon = iconByKey[item.key]
+              const isActive = activeKey === item.key
+              const badgeCount = notificationModuleByMenuKey[item.key]?.reduce(
+                (sum, mod) => sum + (moduleBadgeCounts[mod] || 0), 0
+              ) || 0
+              return (
+                <li key={item.key}>
+                  <NavLink
+                    to={buildBranchScopedPath(item.path, branchContext)}
+                    onClick={closeSidebar}
+                    className={`flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-semibold transition-all ${
+                      isActive
+                        ? 'bg-white text-emerald-800 shadow-[0_2px_8px_rgba(16,120,74,0.25)]'
+                        : 'text-emerald-50 hover:bg-emerald-600/35'
+                    }`}
+                  >
+                    <Icon className="h-4 w-4" />
+                    {item.label}
+                    {badgeCount > 0 && (
+                      <span className="ml-auto inline-flex min-w-5 items-center justify-center rounded-full bg-red-500 px-1.5 text-[10px] font-bold text-white">
+                        {badgeCount}
+                      </span>
+                    )}
+                  </NavLink>
+                </li>
+              )
+            })}
+          </ul>
+        </nav>
+
+        {/* User card */}
+        <div className="shrink-0 border-t border-white/15 px-4 py-4">
+          <div className="rounded-xl bg-white/10 px-3 py-3">
+            <Link to="/buyer/profile" onClick={closeSidebar} className="block">
+              <p className="text-sm font-bold text-white">{buyerName}</p>
+              <p className="text-xs text-emerald-100">{buyerRole}</p>
+            </Link>
+            <button
+              className="mt-3 inline-flex items-center gap-2 text-sm font-semibold text-white/90 transition hover:text-white"
+              onClick={handleLogout}
+            >
+              <LogOut className="h-4 w-4" />
+              Đăng xuất
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="h-screen overflow-hidden bg-emerald-50/30 text-emerald-950">
+
+      {/* ── Mobile: overlay backdrop ── */}
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-slate-950/40 backdrop-blur-sm lg:hidden"
+          onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
+      {/* ── Mobile: slide-in drawer ── */}
+      <aside
+        className={`fixed inset-y-0 left-0 z-50 w-[260px] transform bg-gradient-to-b from-emerald-700 to-emerald-900 text-white shadow-2xl transition-transform duration-300 ease-in-out lg:hidden ${
+          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+        }`}
+      >
+        <button
+          onClick={() => setSidebarOpen(false)}
+          className="absolute right-3 top-4 z-10 inline-flex h-8 w-8 items-center justify-center rounded-full text-emerald-200 transition hover:bg-white/20 hover:text-white"
+          aria-label="Đóng menu"
+        >
+          <X className="h-4 w-4" />
+        </button>
+        <SidebarContent />
+      </aside>
+
+      {/* ── Main layout ── */}
+      <div className="flex h-screen">
+        {/* Desktop sidebar */}
+        <aside className="hidden w-[230px] shrink-0 flex-col border-r border-emerald-700/35 bg-gradient-to-b from-emerald-700 to-emerald-900 text-white lg:flex">
+          <SidebarContent />
+        </aside>
+
+        {/* Main area */}
+        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+          <header className="shrink-0 sticky top-0 z-30 border-b border-emerald-200 bg-white/95 px-4 py-3 shadow-sm backdrop-blur-sm">
+            <div className="flex items-center justify-between gap-3">
+              {/* Left: hamburger + title */}
+              <div className="flex min-w-0 items-center gap-3">
+                {/* Hamburger — mobile only */}
+                <button
+                  onClick={() => setSidebarOpen(true)}
+                  className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-sm transition hover:bg-emerald-100 lg:hidden"
+                  aria-label="Mở menu"
+                >
+                  <Menu className="h-5 w-5" />
+                </button>
+
+                <div className="min-w-0">
+                  <h1 className="truncate text-lg font-extrabold leading-tight text-emerald-950 sm:text-xl lg:text-[22px]">
+                    {title}
+                  </h1>
+                  <p className="hidden truncate text-xs text-emerald-900/60 sm:block">{subtitle}</p>
+                </div>
+              </div>
+
+              {/* Right actions */}
+              <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+                {/* Bell */}
+                <button
+                  className="relative inline-flex h-8 w-8 items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700 transition hover:bg-emerald-100"
+                  onClick={() => setOpenNotifications(true)}
+                  aria-label="Thông báo"
+                >
+                  <Bell className={`h-4 w-4 ${hasNewNotificationAnimation ? 'animate-bell' : ''}`} />
+                  {displayedUnreadCount > 0 && (
+                    <span className="absolute -right-1 -top-1 inline-flex min-h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold leading-none text-white ring-2 ring-white">
+                      {formatBadgeCount(displayedUnreadCount)}
+                    </span>
+                  )}
+                </button>
+
+                {/* User pill */}
+                <Link
+                  to="/buyer/profile"
+                  className="flex items-center gap-2 rounded-full bg-emerald-50 px-2 py-1.5 transition hover:bg-emerald-100 sm:px-3"
+                >
+                  <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-emerald-200 text-sm font-bold text-emerald-800">
+                    {buyerInitials}
+                  </span>
+                  <div className="hidden sm:block">
+                    <p className="text-sm font-bold text-emerald-900">{buyerName}</p>
+                    <p className="text-xs text-emerald-700/70">{buyerRole}</p>
+                  </div>
+                </Link>
+              </div>
+            </div>
+
+            {/* Subtitle on mobile */}
+            <p className="mt-1 truncate text-xs text-emerald-900/60 sm:hidden">{subtitle}</p>
+
+            {actions ? <div className="mt-2">{actions}</div> : null}
+          </header>
+
+          {filterBar ? (
+            <div className="shrink-0 sticky top-[var(--shell-header-h,60px)] z-20 border-b border-slate-100 bg-white/95 px-4 py-2 shadow-sm backdrop-blur-sm">
+              {filterBar}
+            </div>
+          ) : null}
+
+          <div className="flex-1 overflow-y-auto p-4">{children}</div>
+        </main>
+      </div>
+      {slideNotification ? (
+        <button
+          className="fixed right-4 top-4 z-[85] w-[min(420px,calc(100%-2rem))] rounded-xl border border-emerald-200 bg-white p-3 text-left shadow-lg"
+          onClick={() => navigate(resolveNotificationRoute(slideNotification))}
+        >
+          <p className="text-sm font-bold text-slate-900">{slideNotification.title}</p>
+          <p className="mt-1 text-sm text-slate-600">{slideNotification.body}</p>
+        </button>
+      ) : null}
+      <NotificationDrawer
+        open={openNotifications}
+        onClose={() => setOpenNotifications(false)}
+        onUnreadCountChange={setUnreadCount}
+        onNotificationsChange={(nextItems) => {
+          notificationItemsRef.current = nextItems
+          setNotificationItems(nextItems)
+          setModuleBadgeCounts(moduleCounts(nextItems))
+        }}
+        onNotificationClick={(route) => navigate(route)}
+        initialItems={notificationItems}
+        initialUnreadCount={displayedUnreadCount}
+        soundEnabled={soundEnabled}
+        onSoundEnabledChange={(enabled) => {
+          setSoundEnabled(enabled)
+          setNotificationSoundEnabled(enabled)
+        }}
+      />
+    </div>
+  )
+}
